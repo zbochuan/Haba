@@ -85,16 +85,66 @@ where
         completed_rewards
     }
 
-    pub fn get_buffer_len(&self) -> Option<usize> {
-        self.buffer.as_ref().map(|b| b.len())
+    pub fn get_buffer_len(&self) -> usize {
+        self.buffer.as_ref().map_or(0, |b| b.len())
     }
 
     pub fn train_step(&mut self, batch_size: usize) {
         if let Some(buf) = &self.buffer {
             if buf.len() >= batch_size {
-                let batch = buf.sample(batch_size);
-                self.policy.learn(&batch);
+                self.policy.learn(&buf.sample(batch_size));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::ReplayBuffer;
+    use crate::mock::MockEnv;
+    use crate::venv::DummyVectorEnv;
+
+    struct MockPolicy;
+
+    impl crate::policy::Policy for MockPolicy {
+        type Observation = f64;
+        type Action = ();
+
+        fn forward(&mut self, obs: &[Self::Observation]) -> Vec<Self::Action> {
+            // Return N actions where N = batch size (obs.len())
+            vec![(); obs.len()]
+        }
+
+        fn learn(&mut self, _batch: &crate::batch::Batch<Self::Observation, Self::Action>) {
+            // No-op
+        }
+    }
+
+    #[test]
+    fn test_collector_basic() {
+        // 1. Setup MockEnv
+        // Max steps 5. Obs: 0->1->2->3->4->5(done)
+        let venv = DummyVectorEnv::new(vec![MockEnv::new(5), MockEnv::new(5)]);
+
+        // 2. Policy (Mock)
+        let policy = MockPolicy;
+
+        // 3. Buffer
+        let buffer = ReplayBuffer::new(100);
+
+        // 4. Collector
+        let mut collector = Collector::new(venv, policy, Some(buffer));
+
+        // 5. Collect 10 steps (should fill some buffer)
+        // 2 envs. 5 steps each to complete episode.
+        // 10 steps total = 5 steps per env = 1 episode per env.
+        let rewards = collector.collect(10);
+
+        // 6. Verify
+        assert_eq!(collector.get_buffer_len(), 10);
+        assert_eq!(rewards.len(), 2); // 2 episodes finished
+        assert_eq!(rewards[0], 5.0); // Reward is 1.0 per step, 5 steps = 5.0
+        assert_eq!(rewards[1], 5.0);
     }
 }

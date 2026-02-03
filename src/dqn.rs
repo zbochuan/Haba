@@ -10,6 +10,7 @@ pub struct DQNPolicy {
     q_net: QNet,
     target_q_net: QNet,
     varmap: VarMap,
+    target_varmap: VarMap,
     optimizer: AdamW,
     device: Device,
 
@@ -33,19 +34,11 @@ impl DQNPolicy {
         let vb = VarBuilder::from_varmap(&varmap, DType::F64, &device);
 
         let q_net = QNet::new(in_dim, hidden_dim, out_dim, vb.clone())?;
-        // Target net with same structure but separate vars?
-        // Actually generic VarMap usage is tricky for target nets.
-        // Simple approach: clone the struct IF it holds weights, but QNet holds Linear layers which hold Tensors.
-        // candle_nn::Linear holds Tensor.
-        // We need a separate VarMap for target net or just manually copy weights?
-        // Let's create a separate varmap for target to be safe and independent.
+
+        // Target net with separate vars
         let target_varmap = VarMap::new();
         let target_vb = VarBuilder::from_varmap(&target_varmap, DType::F64, &device);
         let target_q_net = QNet::new(in_dim, hidden_dim, out_dim, target_vb)?;
-
-        // Initial sync
-        // For simplicity, let's just ignore target net sync logic for a moment or implement a manual copy helper.
-        // In Candle, we can load state dicts.
 
         // Optimizer
         let params = ParamsAdamW {
@@ -54,25 +47,37 @@ impl DQNPolicy {
         };
         let optimizer = AdamW::new(varmap.all_vars(), params)?;
 
-        Ok(Self {
+        let mut policy = Self {
             q_net,
             target_q_net,
             varmap,
+            target_varmap,
             optimizer,
             device,
             gamma,
             epsilon,
             target_update_freq: 100,
             update_count: 0,
-        })
+        };
+
+        // Initial sync
+        policy.sync_target()?;
+
+        Ok(policy)
     }
 
     fn sync_target(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Naive copy: we should implement a cleaner way via serialization or direct tensor copy
-        // For now, let's skip strict "Target Net" logic to just get "Q Learning" working first if complex.
-        // But DQN needs it.
-        // Let's just create target_q_net by cloning q_net?
-        // No, q_net holds loaded tensors.
+        let src_data = self.varmap.data();
+        let target_data = self.target_varmap.data();
+
+        let src_lock = src_data.lock().unwrap();
+        let mut target_lock = target_data.lock().unwrap();
+
+        for (name, src_var) in src_lock.iter() {
+            if let Some(target_var) = target_lock.get_mut(name) {
+                target_var.set(&src_var.as_tensor())?;
+            }
+        }
         Ok(())
     }
 }
@@ -110,6 +115,10 @@ impl Policy for DQNPolicy {
     }
 
     fn learn(&mut self, batch: &Batch<Self::Observation, Self::Action>) {
+        if self.update_count % self.target_update_freq == 0 {
+            self.sync_target().unwrap();
+        }
+
         // 1. Prepare Tensors
         let b_size = batch.len();
         let obs_flat: Vec<f64> = batch.obs.iter().flatten().cloned().collect();
@@ -131,12 +140,9 @@ impl Policy for DQNPolicy {
         let done = Tensor::from_vec(dones, (b_size, 1), &self.device).unwrap();
 
         // 2. Compute Target Q
-        // Q_target = r + gamma * max(Q(s', a'))
-        // We use q_net for now (Double DQN would use target_net for action selection)
-        // Standard DQN uses target_net for value estimation.
-        // Let's stick to using q_net for both for simplicity (Naive DQN) first, or try to use target_q_net if feasible.
-        // Since we didn't implement sync, let's use q_net (it's unstable but should learn something).
-        let next_q_values = self.q_net.forward(&next_obs).unwrap();
+        // Q_target = r + gamma * max(Q_target(s', a'))
+        // Use target_q_net for stability
+        let next_q_values = self.target_q_net.forward(&next_obs).unwrap().detach();
         let max_next_q = next_q_values.max(1).unwrap().reshape((b_size, 1)).unwrap();
         let target_q = (reward + (1.0 - done).unwrap() * self.gamma * max_next_q)
             .unwrap()
@@ -159,5 +165,53 @@ impl Policy for DQNPolicy {
         self.optimizer.backward_step(&loss).unwrap();
 
         self.update_count += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::batch::Batch;
+
+    #[test]
+    fn test_dqn_forward() {
+        // 1. Setup
+        let mut policy = DQNPolicy::new(4, 16, 2, 0.99, 0.0).unwrap(); // Epsilon 0.0 for deterministic greedy
+
+        // 2. Create Dummy Batch Observations
+        let obs1 = vec![0.0, 0.0, 0.0, 0.0];
+        let obs2 = vec![1.0, 1.0, 1.0, 1.0];
+        let obs_batch = vec![obs1, obs2];
+
+        // 3. Inference
+        let actions = policy.forward(&obs_batch);
+
+        // 4. Verification
+        assert_eq!(actions.len(), 2);
+        // Actions should be 0.0 or 1.0
+        assert!(actions[0] == 0.0 || actions[0] == 1.0);
+        assert!(actions[1] == 0.0 || actions[1] == 1.0);
+    }
+
+    #[test]
+    fn test_dqn_learn() {
+        // 1. Setup
+        let mut policy = DQNPolicy::new(4, 16, 2, 0.99, 0.1).unwrap();
+
+        // 2. Create Dummy Batch
+        let obs = vec![vec![0.0; 4], vec![1.0; 4]];
+        let next_obs = vec![vec![0.0; 4], vec![1.0; 4]];
+        let act = vec![0.0, 1.0];
+        let rew = vec![1.0, 0.0];
+        let done = vec![false, true];
+
+        let batch = Batch::new(obs, act, rew, done, next_obs);
+
+        // 3. Learn
+        // Just verify it doesn't panic
+        policy.learn(&batch);
+
+        // Verify update count increased
+        assert_eq!(policy.update_count, 1);
     }
 }
