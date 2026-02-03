@@ -7,3 +7,7 @@ edition = "2024"
 rand = "0.8.5"
 candle-core = "0.8.0"
 candle-nn = "0.8.0"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]

@@ -29,7 +29,13 @@ impl DQNPolicy {
         gamma: f64,
         epsilon: f64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let device = Device::Cpu;
+        let device = if candle_core::utils::cuda_is_available() {
+            println!("CUDA detected! Using GPU.");
+            Device::new_cuda(0)?
+        } else {
+            println!("CUDA not detected. Using CPU.");
+            Device::Cpu
+        };
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F64, &device);
 
